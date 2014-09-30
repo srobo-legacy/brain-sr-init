@@ -1,0 +1,305 @@
+#!/usr/bin/env python
+import ctypes
+import os
+import socket
+import subprocess
+from subprocess import ( check_call, check_output, CalledProcessError )
+import stat
+import threading
+import time
+import yaml
+from zipfile import ZipFile
+
+# Where the user key is mounted
+USER_MOUNTPOINT = "/tmp/mount"
+
+class UeventReceiver(object):
+    def __init__(self):
+        # Connect in to netlink to get uevents
+        self.s = socket.socket( socket.AF_NETLINK,
+                                socket.SOCK_DGRAM,
+                                # NETLINK_KOBJECT_UEVENT is 15:
+                                15 )
+        self.s.bind( (os.getpid(), 1) )
+
+    def getevent(self):
+        d = self.s.recv(1024)
+        i = d.split("\x00")
+
+        title = i[0]
+        vals = {}
+        for s in i[1:]:
+            n = s.find("=")
+            key = s[0:n]
+            val = s[n+1:]
+            vals[key] = val
+
+        return (title, vals)
+
+class RobotZip(object):
+    def __init__(self, fname):
+        self.fname = fname
+        # Directory the zipfile is in
+        self.zipdir = os.path.dirname(self.fname)
+
+        # Read info.yaml from the zip file
+        with ZipFile(self.fname, "r") as z:
+            try:
+                i = z.getinfo("info.yaml")
+            except KeyError:
+                self.info = {}
+                "There's no info.yaml"
+                return
+
+            with z.open(i, "r") as f:
+                self.info = yaml.load(f)
+
+            if self.info is None:
+                "Parser responds with None if there's an empty file"
+                self.info = {}
+
+    def extract_to(self, fname, dest):
+        "Extract fname from the zip and put it at dest"
+        with ZipFile(self.fname, "r") as z:
+            with z.open(fname, "r") as f:
+                c = f.read()
+
+        with open(dest, "w") as f:
+            f.write(c)
+
+    def internal_apply(self, filename, filesize):
+        "Apply an overlay that's internal to the zip"
+        # Copy it into /tmp (internal overlays have to be small)
+        target = "/tmp/internal-overlay"
+
+        try:
+            self.extract_to(filename, target)
+        except KeyError:
+            raise Exception("Overlay not found")
+
+        if os.path.getsize(target) != filesize:
+            raise Exception("Overlay is of incorrect size")
+
+        return self._apply_overlay(target)
+
+    def internal_exec(self, filename):
+        "Execute a program that's internal to the zip"
+        target = "/tmp/internal-overlay"
+
+        try:
+            self.extract_to(filename, target)
+        except KeyError:
+            raise Exception("Overlay executable not found")
+
+        check_call(["chmod", "u+x", target])
+        check_call(target)
+        # Applying the overlay and pivoting etc is left to the executable
+        return "", False, False
+
+    def external_apply(self, filename, filesize):
+        "Apply an overlay that's external to the zip"
+
+        # Check it exists and is the right size
+        opath = os.path.join( self.zipdir, filename )
+        if not os.path.exists( opath ):
+            raise Exception("Overlay not found")
+
+        if os.path.getsize( opath ) != filesize:
+            raise Exception("Overlay is of incorrect size")
+
+        return self._apply_overlay( opath )
+
+    def apply_overlay(self):
+        "Apply and pivot to any overlays the robot.zip requires"
+
+        if "overlay" not in self.info \
+           or "type" not in self.info["overlay"]:
+            "There is no overlay to be applied"
+            return "", False, True
+
+        oinfo = self.info["overlay"]
+        overlay_type = oinfo["type"]
+
+        if overlay_type == "external":
+            return self.external_apply(oinfo["filename"], oinfo["filesize"])
+
+        elif overlay_type == "internal":
+            return self.internal_apply(oinfo["filename"], oinfo["filesize"])
+
+        elif overlay_type == "executable":
+            return self.internal_exec(oinfo["filename"])
+
+        return "", False, True
+
+    @staticmethod
+    def _apply_overlay(overlay_fname):
+        "Apply the given overlay and pivot to it"
+
+        overlay_upper = "/tmp/overlay-upper"
+        if not os.path.exists(overlay_upper):
+            os.mkdir(overlay_upper)
+
+        # Create a loop device
+        for x in [0,1]:
+            dev = "/dev/loop{}".format(x)
+            if not os.path.exists(dev):
+                os.mknod(dev,
+                         0600 | stat.S_IFBLK,
+                         os.makedev(7, x))
+
+        check_call( [ "mount",
+                      "-o", "loop",
+                      "-o", "ro",
+                      overlay_fname, overlay_upper ] )
+
+        # Bind mount the root fs to form the lower part of the overlay
+        overlay_lower = "/tmp/overlay-lower"
+        if not os.path.exists(overlay_lower):
+            os.mkdir(overlay_lower)
+        check_call( [ "mount", "--bind", "/", overlay_lower ] )
+
+        # Now mount it as an overlay
+        overlay_merged = "/tmp/overlay-merged"
+        if not os.path.exists(overlay_merged):
+            os.mkdir(overlay_merged)
+
+        check_call( [ "mount",
+                      "-t", "overlayfs",
+                      "-o", "lowerdir={}".format(overlay_lower),
+                      "-o", "upperdir={}".format(overlay_upper),
+                      "-o", "ro",
+                      "overlayfs",
+                      overlay_merged ] )
+
+        # Now pivot to it
+        os.chdir( overlay_merged )
+        check_call( ["/sbin/pivot_root", ".", "old_root"] )
+
+        return "/old_root", True, True
+
+def get_fs_type(dev):
+    "Return the filesystem type of the given partition"
+
+    try:
+        output = check_output( ["/sbin/blkid",
+                                # No cache please
+                                "-c", "/dev/null",
+                                "-p", dev,
+                                "-s", "TYPE",
+                                "-o", "export"] )
+    except CalledProcessError:
+        "blkid doesn't work on all devices"
+        return None
+
+    for l in output.splitlines():
+        info = l.split("=")
+
+        if info[0] != "TYPE":
+            continue
+
+        return info[1]
+
+    # We don't know what it is
+    return None
+
+def trigger():
+    # Scan through sysfs, writing "add" to each block device's "uevent"
+    uevents = []
+    for dirpath, dirnames, filenames in os.walk("/sys/devices"):
+        if "uevent" not in filenames:
+            continue
+
+        p = os.path.join( dirpath, "uevent" )
+        with open(p, "w") as f:
+            f.write("add")
+
+# Wait for a USB key to arrive
+# We use netlink to receive uevents
+# We do this to avoid having to start a whole udev instance at this point
+u = UeventReceiver()
+
+# Mount sysfs
+if not os.path.exists("/sys"):
+    os.mkdir("/sys")
+check_call( ["mount", "-t", "sysfs", "sysfs", "/sys"] )
+
+# Mount procfs
+if not os.path.exists("/proc"):
+    os.mkdir("/proc")
+check_call( ["mount", "-t", "proc", "procfs", "/proc"] )
+
+# Mount tmpfs's at /tmp and /dev
+for path in ["/tmp", "/dev"]:
+    if not os.path.exists(path):
+        os.mkdir(path)
+    check_call( ["mount", "-t", "tmpfs", "tmpfs", path] )
+
+t = threading.Thread(target=trigger)
+t.start()
+
+while True:
+    title, vals = u.getevent()
+
+    if "SUBSYSTEM" not in vals or vals["SUBSYSTEM"] != "block":
+        continue
+
+    if "ACTION" not in vals or vals["ACTION"] != "add":
+        continue
+
+    if "DEVTYPE" not in vals or vals["DEVTYPE"] not in ["partition", "disk"]:
+        continue
+
+    dev = (vals["MAJOR"], vals["MINOR"])
+
+    # Create device node for it so we can mount it
+    p = "/dev/{0}".format(vals["DEVNAME"])
+    os.mknod(p, 0600 | stat.S_IFBLK,
+             os.makedev(int(vals["MAJOR"]),
+                        int(vals["MINOR"])))
+    check_call( ["ls", "-l", p] )
+
+    if not os.path.exists(USER_MOUNTPOINT):
+        os.mkdir(USER_MOUNTPOINT)
+
+    # Mount it
+    print "Trying", p
+    fs = get_fs_type(p)
+    mount_opts = []
+    if fs == "vfat":
+        mount_opts += ["-o", "flush"]
+
+    try:
+        check_call( [ "mount" ] + mount_opts + [ p, USER_MOUNTPOINT ] )
+    except subprocess.CalledProcessError:
+        # We can't mount it for some reason, so skip it
+        print "Can't mount", p, "- skipping"
+        continue
+
+    # Check for robot.zip
+    zip_path = os.path.join(USER_MOUNTPOINT, "robot.zip")
+    if not os.path.exists(zip_path):
+        # it's not there...
+        print "No robot.zip on", p
+        check_call( ["mount"] )
+        check_call( [ "umount", USER_MOUNTPOINT ] )
+        continue
+
+    rzip = RobotZip(zip_path)
+
+    # Reboot the system if this device is removed
+    subprocess.Popen( ["rebooter", vals["DEVNAME"]] )
+
+    # Load the overlay if there is one
+    prefix, remount_proc, umount_things = rzip.apply_overlay()
+    if remount_proc:
+        # Remount proc in the right place
+        check_call(["mount", "-t", "proc", "proc", "/proc"])
+
+    # systemd boots in a different mode if these are already mounted
+    if umount_things:
+        check_call(["umount", "{}/dev".format(prefix)])
+        check_call(["umount", "{}/sys".format(prefix)])
+        check_call(["umount", "{}/proc".format(prefix)])
+
+    # Now invoke systemd
+    os.execl("/lib/systemd/systemd", "/lib/systemd/systemd")

@@ -1,0 +1,50 @@
+#!/usr/bin/env python
+import argparse
+from ctypes import CDLL
+import os
+import socket
+
+class UeventReceiver(object):
+    def __init__(self):
+        # Connect in to netlink to get uevents
+        self.s = socket.socket( socket.AF_NETLINK,
+                                socket.SOCK_DGRAM,
+                                # NETLINK_KOBJECT_UEVENT is 15:
+                                15 )
+        self.s.bind( (os.getpid(), 1) )
+
+    def getevent(self):
+        d = self.s.recv(1024)
+        i = d.split("\x00")
+
+        title = i[0]
+        vals = {}
+        for s in i[1:]:
+            n = s.find("=")
+            key = s[0:n]
+            val = s[n+1:]
+            vals[key] = val
+
+        return (title, vals)
+
+p = argparse.ArgumentParser()
+p.add_argument("devname", help="The device to monitor")
+args = p.parse_args()
+
+libc = CDLL('libc.so.6')
+u = UeventReceiver()
+
+while True:
+    title, vals = u.getevent()
+
+    if "SUBSYSTEM" not in vals or vals["SUBSYSTEM"] != "block":
+        continue
+
+    if "ACTION" not in vals or vals["ACTION"] != "remove":
+        continue
+
+    if "DEVNAME" not in vals or vals["DEVNAME"] != args.devname:
+        continue
+
+    # It's been removed, so reboot:
+    libc.reboot(0x1234567)

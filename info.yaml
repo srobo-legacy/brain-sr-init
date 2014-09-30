@@ -1,0 +1,8 @@
+
+# Overlay requirements information:
+overlay:
+  type: "external"
+  filename: "support-0"
+  filesize: 1234
+
+
