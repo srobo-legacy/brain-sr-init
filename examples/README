@@ -1,0 +1,5 @@
+Three examples for info.yaml:
+
+ - internal.yaml: Take overlay from inside robot.zip.
+ - external.yaml: Take overlay from USB key.
+ - executable.yaml: Run script from robot.zip.

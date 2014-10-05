@@ -1,0 +1,5 @@
+# An overlay that's internal to the zip file
+overlay:
+  type: "internal"
+  filename: "support-0"
+  filesize: 1234

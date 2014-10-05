@@ -1,8 +1,5 @@
-
-# Overlay requirements information:
+# An overlay that's external to the zip file
 overlay:
   type: "external"
   filename: "support-0"
   filesize: 1234
-
-

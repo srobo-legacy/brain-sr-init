@@ -1,0 +1,5 @@
+# Farm out all of the pivoting operation out to the given
+# executable that's inside the zip file
+overlay:
+  type: "executable"
+  filename: "pivot"
