@@ -253,9 +253,10 @@ while True:
 
     # Create device node for it so we can mount it
     p = "/dev/{0}".format(vals["DEVNAME"])
-    os.mknod(p, 0600 | stat.S_IFBLK,
-             os.makedev(int(vals["MAJOR"]),
-                        int(vals["MINOR"])))
+    if not os.path.exists(p):
+        os.mknod(p, 0600 | stat.S_IFBLK,
+                 os.makedev(int(vals["MAJOR"]),
+                            int(vals["MINOR"])))
     check_call( ["ls", "-l", p] )
 
     if not os.path.exists(USER_MOUNTPOINT):
