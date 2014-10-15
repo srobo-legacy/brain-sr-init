@@ -23,7 +23,16 @@ class UeventReceiver(object):
         self.s.bind( (os.getpid(), 1) )
 
     def getevent(self):
-        d = self.s.recv(1024)
+        while True:
+            try:
+                d = self.s.recv(10240)
+                break
+            except socket.error:
+                # We missed a datagram
+                # This happens when we don't process events from the netlink
+                # socket fast enough, and the receive buffer fills up
+                continue
+
         i = d.split("\x00")
 
         title = i[0]
