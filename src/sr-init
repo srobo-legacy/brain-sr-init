@@ -258,6 +258,11 @@ while True:
     if "DEVTYPE" not in vals or vals["DEVTYPE"] not in ["partition", "disk"]:
         continue
 
+    # This is moderately hacky, but serves the purpose to reduce the
+    # number of devices that we try and mount
+    if "DEVPATH" not in vals or "usb" not in vals["DEVPATH"]:
+        continue
+
     dev = (vals["MAJOR"], vals["MINOR"])
 
     # Create device node for it so we can mount it
