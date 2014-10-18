@@ -11,7 +11,7 @@ import yaml
 from zipfile import ZipFile
 
 # Where the user key is mounted
-USER_MOUNTPOINT = "/tmp/mount"
+USER_MOUNTPOINT = "/mnt/user"
 
 class UeventReceiver(object):
     def __init__(self):
